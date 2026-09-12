@@ -856,3 +856,1073 @@ NoteTool 持久化
 Reflection Agent
 稳定的来源引用体系
 ```
+
+## 13. 生产级架构补充设计
+
+本章节将 Redis、状态机、搜索降级、网页质量过滤、长期记忆和多智能体编排纳入统一的生产级设计。
+
+### 13.1 设计目标
+
+生产版本需要同时满足以下目标：
+
+- 研究流程可恢复、可取消、可重试
+- 单个任务失败不影响其他任务
+- 上下文长度可控，不依赖全量对话历史
+- 相同网页和查询可以跨任务复用
+- 搜索服务故障时能够自动降级
+- 低质量、重复和无关网页不会直接进入 LLM 上下文
+- 任务级中间结果可追踪、可持久化
+- 报告中的引用可以追溯到固定来源
+- 研究成本、延迟和质量可以量化
+- 真实 API Key、用户数据和运行时状态相互隔离
+
+### 13.2 目标总体架构
+
+```text
+Vue 3
+  |
+  | REST + SSE
+  v
+FastAPI API Layer
+  |
+  ├── ResearchService
+  │     └── 创建、查询、取消、恢复研究
+  |
+  ├── ResearchOrchestrator
+  │     └── 驱动研究状态机
+  |
+  ├── Agent Layer
+  │     ├── PlannerAgent
+  │     ├── SearchQueryAgent
+  │     ├── SummarizerAgent
+  │     ├── ReflectionAgent
+  │     └── ReporterAgent
+  |
+  ├── Tool Layer
+  │     ├── SearchTool
+  │     ├── PageFetchTool
+  │     ├── SourceFilterTool
+  │     └── NoteTool
+  |
+  ├── Context Layer
+  │     ├── Redis Runtime State
+  │     ├── Query Cache
+  │     ├── Page Cache
+  │     ├── Summary Cache
+  │     └── Event Stream Cache
+  |
+  ├── Persistence Layer
+  │     ├── PostgreSQL 或 SQLite：结构化元数据
+  │     ├── Workspace：Markdown 报告和任务笔记
+  │     └── Object Storage：大网页内容和附件
+  |
+  └── External Services
+        ├── Tokeness LLM
+        ├── Tavily
+        ├── DuckDuckGo
+        └── Baidu 或其他搜索服务
+```
+
+生产环境建议将长时间研究任务放入后台 Worker，而不是让 FastAPI 请求线程直接执行：
+
+```text
+POST /api/research
+  -> 创建 ResearchState
+  -> 投递 ResearchJob
+  -> 立即返回 research_id
+
+Worker
+  -> 执行状态机
+  -> 写入 Redis 和持久化存储
+  -> 发布 SSE 事件
+
+GET /api/research/{research_id}/stream
+  -> 读取事件并推送前端
+```
+
+初期可以使用 FastAPI BackgroundTasks，生产环境建议使用 Celery、RQ、Arq 或其他可靠队列。
+
+## 14. 多智能体编排设计
+
+### 14.1 Agent 职责
+
+```text
+ResearchOrchestrator
+  ├── PlannerAgent
+  │     └── 生成、校验和排序研究任务
+  │
+  ├── SearchQueryAgent
+  │     └── 为任务生成搜索查询和补充查询
+  │
+  ├── SummarizerAgent
+  │     └── 将原始来源压缩为任务级事实摘要
+  │
+  ├── ReflectionAgent
+  │     └── 检查覆盖度、冲突和知识缺口
+  │
+  └── ReporterAgent
+        └── 基于任务摘要生成最终报告
+```
+
+### 14.2 Agent 输入输出约束
+
+每个 Agent 必须有明确的输入和输出，不应该共享一个不断增长的完整对话历史。
+
+```text
+PlannerAgent
+输入：topic、日期、用户要求、历史相关摘要
+输出：ResearchTask[]
+
+SummarizerAgent
+输入：ResearchTask、FilteredSource[]
+输出：TaskSummary
+
+ReflectionAgent
+输入：ResearchTask[]、TaskSummary[]、SourceQualityStats
+输出：ReflectionResult
+
+ReporterAgent
+输入：topic、TaskSummary[]、SourceRegistry
+输出：ResearchReport
+```
+
+### 14.3 Agent 之间只传递结构化状态
+
+不建议将 Agent 的完整历史消息直接传给下一个 Agent。建议只传递：
+
+- 当前任务
+- 当前阶段摘要
+- 固定来源编号
+- 结构化事实
+- 未解决问题
+- 质量分数
+- Token 预算
+
+示例：
+
+```json
+{
+  "task_id": "task-002",
+  "title": "行业应用现状",
+  "facts": [
+    {
+      "claim": "...",
+      "source_ids": ["S003", "S007"],
+      "confidence": 0.86
+    }
+  ],
+  "open_questions": ["缺少 2025 年官方数据"],
+  "summary": "..."
+}
+```
+
+### 14.4 多智能体不是无限对话
+
+系统应该采用有限、可观测的编排流程，而不是让多个 Agent 自由互聊：
+
+```text
+PlannerAgent
+  -> TaskExecutor
+  -> SummarizerAgent
+  -> ReflectionAgent
+  -> Follow-up TaskExecutor（可选）
+  -> ReporterAgent
+```
+
+每个 Agent 调用都必须有：
+
+- 最大调用次数
+- 最大 Token 数
+- 单次超时
+- 总体超时预算
+- 明确失败状态
+- 可重试条件
+
+## 15. 研究状态机设计
+
+### 15.1 研究状态
+
+```text
+CREATED
+  -> PLANNING
+  -> PLAN_VALIDATED
+  -> TASKS_QUEUED
+  -> SEARCHING
+  -> FILTERING
+  -> SUMMARIZING
+  -> TASK_COMPLETED
+  -> REFLECTING
+       ├── FOLLOW_UP_REQUIRED -> TASKS_QUEUED
+       └── REPORTING
+  -> COMPLETED
+```
+
+异常转移：
+
+```text
+任意运行状态 -> FAILED
+任意运行状态 -> CANCEL_REQUESTED -> CANCELLED
+```
+
+### 15.2 任务状态
+
+```text
+PENDING
+  -> SEARCHING
+  -> FILTERING
+  -> SUMMARIZING
+  -> COMPLETED
+
+PENDING / SEARCHING / FILTERING / SUMMARIZING
+  -> RETRYING
+  -> FAILED
+  -> SKIPPED
+```
+
+### 15.3 状态转移约束
+
+所有状态转移必须经过统一函数，不能在业务代码中随意修改状态：
+
+```python
+transition(
+    research_id="r-001",
+    from_state="SEARCHING",
+    to_state="SUMMARIZING",
+    reason="search_completed",
+)
+```
+
+每次转移写入：
+
+```json
+{
+  "research_id": "r-001",
+  "task_id": "task-001",
+  "from": "SEARCHING",
+  "to": "SUMMARIZING",
+  "reason": "search_completed",
+  "attempt": 1,
+  "timestamp": "2026-09-10T10:00:00Z"
+}
+```
+
+### 15.4 状态机恢复
+
+Worker 重启后，根据 Redis 或数据库中的状态恢复：
+
+```text
+SEARCHING
+  -> 检查上一次请求是否有结果
+  -> 有结果：进入 FILTERING
+  -> 无结果且未超时：重试搜索
+  -> 已超出重试次数：标记任务失败
+```
+
+不要依赖内存中的 Python 变量恢复研究。
+
+## 16. Redis 上下文工程
+
+### 16.1 Redis 的职责边界
+
+Redis 负责高频、临时、可重建的运行时数据：
+
+- 研究状态
+- 任务状态
+- 搜索结果缓存
+- 网页内容缓存
+- 任务摘要缓存
+- SSE 事件缓冲
+- 分布式锁
+- 限流计数器
+
+长期报告和正式研究笔记不建议只存 Redis，应同步保存到数据库、文件系统或对象存储。
+
+### 16.2 Redis Key 设计
+
+```text
+research:{research_id}
+research:{research_id}:tasks
+research:{research_id}:events
+research:{research_id}:sources
+task:{research_id}:{task_id}
+query:{query_hash}
+page:{url_hash}
+summary:{task_hash}
+memory:domain:{domain}
+memory:topic:{topic_hash}
+lock:research:{research_id}
+rate:tavily:{scope}
+```
+
+### 16.3 搜索查询缓存
+
+查询缓存 Key 使用规范化查询生成：
+
+```text
+query_hash = sha256(
+    normalized_query
+    + search_backend
+    + search_depth
+    + max_results
+)
+```
+
+缓存内容：
+
+```json
+{
+  "query": "generative AI education applications",
+  "backend": "tavily",
+  "results": [
+    {
+      "source_id": "S001",
+      "title": "...",
+      "url": "...",
+      "snippet": "..."
+    }
+  ],
+  "created_at": "...",
+  "expires_at": "..."
+}
+```
+
+建议 TTL：
+
+```text
+新闻和实时主题：5 分钟到 1 小时
+普通行业主题：6 小时到 24 小时
+稳定知识主题：1 天到 7 天
+```
+
+### 16.4 网页内容缓存
+
+网页 URL 先经过规范化：
+
+- 删除追踪参数
+- 统一协议和域名大小写
+- 删除末尾斜杠差异
+- 处理 URL 编码
+- 保留必要的业务参数
+
+然后使用：
+
+```text
+page:{sha256(normalized_url)}
+```
+
+缓存中建议同时保存：
+
+- 原始 URL
+- 规范化 URL
+- 页面标题
+- 清洗后的正文
+- 内容摘要
+- 内容哈希
+- 抓取时间
+- HTTP 状态码
+- 页面质量分数
+- 解析器版本
+
+### 16.5 同任务和跨任务去重
+
+同任务去重：
+
+```text
+同一个 research_id 内，不重复处理相同 URL 和相同内容哈希。
+```
+
+跨任务去重：
+
+```text
+优先读取 page:{url_hash} 和 query:{query_hash}，避免重复搜索和抓取。
+```
+
+跨任务缓存必须注意数据隔离：
+
+- 公共网页可以跨用户复用
+- 私有网页必须按用户或租户隔离
+- 包含用户输入的数据不能写入公共缓存
+
+### 16.6 中间摘要缓存
+
+任务摘要写入：
+
+```text
+summary:{task_hash}
+```
+
+`task_hash` 至少包含：
+
+- 任务标题
+- 任务意图
+- 查询结果内容哈希
+- summarizer prompt 版本
+- 模型名称
+
+这样 Prompt 或模型版本改变后，可以自动避免读取旧摘要。
+
+## 17. 上下文预算和状态机替代全量历史
+
+### 17.1 不传递完整对话历史
+
+每个阶段只读取当前需要的上下文：
+
+```text
+规划阶段：主题 + 用户要求 + 少量历史摘要
+搜索阶段：任务 query + 搜索配置
+总结阶段：任务信息 + 过滤后的来源
+反思阶段：任务摘要 + 质量统计 + 未解决问题
+报告阶段：任务摘要 + 来源注册表
+```
+
+### 17.2 Token 预算
+
+建议为每个阶段分配预算：
+
+```text
+Planner：输入 4K，输出 800
+Task Summarizer：输入 8K，输出 1.5K
+Reflection：输入 6K，输出 800
+Reporter：输入 16K，输出 2.5K
+```
+
+具体数值需要根据模型上下文窗口配置，不应写死在代码中。
+
+### 17.3 上下文压缩顺序
+
+当输入超过预算时，按以下顺序压缩：
+
+```text
+1. 删除重复来源
+2. 删除低质量来源
+3. 删除低相关性来源
+4. 使用来源摘要替换正文
+5. 使用任务摘要替换原始搜索结果
+6. 保留与当前任务最相关的事实
+```
+
+不能简单地从字符串尾部截断，因为这可能截断来源 URL 或关键事实。
+
+### 17.4 20 到 30 个网页处理策略
+
+如果需要处理 20 到 30 个网页，不应把全部正文一次性发送给最终报告模型：
+
+```text
+20~30 个网页
+  -> 页面清洗
+  -> 质量评分
+  -> 内容去重
+  -> 按任务分组
+  -> 每组摘要
+  -> 任务级摘要
+  -> 反思
+  -> 最终报告
+```
+
+报告模型只读取：
+
+- 任务级摘要
+- 关键事实
+- 来源编号
+- 少量必要原文片段
+
+## 18. 搜索工具重试与降级
+
+### 18.1 搜索服务优先级
+
+建议将搜索后端抽象为统一接口：
+
+```python
+class SearchProvider(Protocol):
+    name: str
+
+    async def search(self, query: str, options: SearchOptions) -> SearchResponse:
+        ...
+```
+
+生产配置示例：
+
+```env
+SEARCH_PRIMARY=tavily
+SEARCH_FALLBACKS=duckduckgo,baidu
+SEARCH_MAX_PROVIDER_ATTEMPTS=2
+```
+
+推荐默认顺序：
+
+```text
+高质量英文或综合主题：Tavily -> DuckDuckGo
+中文主题：Tavily -> Baidu -> DuckDuckGo
+实时和新闻主题：Tavily -> 其他实时搜索源
+```
+
+具体顺序应根据真实可用性、授权和搜索质量验证后确定。
+
+### 18.2 触发降级的错误
+
+触发重试或降级：
+
+- 连接超时
+- 读取超时
+- DNS 或网络失败
+- 429 限流
+- 500、502、503、504
+- 返回空结果
+- 返回不可解析的响应
+
+不应盲目重试：
+
+- 401 API Key 错误
+- 403 权限错误
+- 404 接口地址错误
+- 参数校验失败
+- 明确的额度耗尽错误
+
+### 18.3 指数退避
+
+```python
+delay = min(
+    base_delay * (2 ** attempt) + random_jitter,
+    max_delay,
+)
+```
+
+建议默认值：
+
+```text
+base_delay = 1 秒
+max_delay = 30 秒
+jitter = 0 到 0.5 秒
+```
+
+如果上游返回 `Retry-After`，优先使用上游建议的等待时间。
+
+### 18.4 降级事件
+
+每次降级都要记录并推送：
+
+```json
+{
+  "type": "provider_fallback",
+  "from": "tavily",
+  "to": "duckduckgo",
+  "reason": "timeout",
+  "attempt": 2
+}
+```
+
+报告中可以记录来源后端，但不应把搜索服务错误细节暴露为用户难以理解的技术堆栈。
+
+## 19. 网页质量过滤
+
+### 19.1 过滤流程
+
+```text
+搜索结果
+  -> URL 规范化
+  -> 域名和页面类型过滤
+  -> 相关性评分
+  -> 来源权威性评分
+  -> 内容完整性评分
+  -> 时效性评分
+  -> 广告和导航噪声检测
+  -> 内容去重
+  -> 保留高质量来源
+```
+
+### 19.2 质量评分模型
+
+```text
+quality_score =
+    0.35 * relevance_score
+  + 0.25 * authority_score
+  + 0.15 * completeness_score
+  + 0.15 * freshness_score
+  + 0.10 * independence_score
+  - noise_penalty
+```
+
+权重应通过离线评测调整，不应直接认为固定权重适合所有主题。
+
+### 19.3 过滤规则
+
+可以优先过滤：
+
+- 空内容或极短页面
+- 纯登录页面
+- 纯导航页
+- 大量广告和弹窗页面
+- URL 和标题明显重复的页面
+- 与任务意图低相关的页面
+- 无法确认来源的转载聚合页
+- 明显的垃圾 SEO 页面
+
+谨慎过滤：
+
+- 个人博客
+- 论坛内容
+- 社交媒体内容
+- 新兴主题的非官方资料
+
+这些页面不一定低质量，应该降低分数而不是简单删除。
+
+### 19.4 质量过滤结果模型
+
+```json
+{
+  "source_id": "S004",
+  "url": "https://example.com/article",
+  "relevance_score": 0.91,
+  "authority_score": 0.80,
+  "freshness_score": 0.76,
+  "quality_score": 0.84,
+  "is_duplicate": false,
+  "is_low_quality": false,
+  "filter_reason": null
+}
+```
+
+“过滤约 60% 劣质网页”只能作为待验证的目标指标，不能作为系统固定保证。应通过固定数据集评估：
+
+```text
+过滤前来源数
+过滤后来源数
+人工标注低质量来源数
+过滤命中率
+误删率
+报告引用有效率
+```
+
+## 20. 来源注册表和引用系统
+
+### 20.1 固定来源 ID
+
+所有来源进入上下文前分配固定 ID：
+
+```text
+S001, S002, S003, ...
+```
+
+模型上下文格式：
+
+```text
+[S001]
+标题：...
+URL：...
+来源质量：0.86
+摘要：...
+```
+
+模型只能使用已存在的来源 ID。
+
+### 20.2 引用校验
+
+报告生成后检查：
+
+- 报告中的来源 ID 是否存在
+- 是否引用了被过滤来源
+- 是否存在未定义来源 ID
+- 关键事实是否至少有一个来源
+- 来源 URL 是否可访问
+
+发现非法引用时，可以：
+
+1. 删除非法引用。
+2. 重新调用一次引用修复 Agent。
+3. 将问题标记到报告质量告警中。
+
+## 21. 长期记忆设计
+
+### 21.1 运行时上下文和长期记忆分离
+
+```text
+运行时上下文
+  -> Redis
+  -> 研究结束后可过期
+
+长期记忆
+  -> 数据库、向量库或对象存储
+  -> 跨研究复用
+```
+
+### 21.2 长期记忆类型
+
+来源质量记忆：
+
+```json
+{
+  "domain": "example.com",
+  "quality_score": 0.82,
+  "successful_uses": 12,
+  "failed_uses": 2,
+  "last_seen_at": "..."
+}
+```
+
+主题知识记忆：
+
+```json
+{
+  "topic": "生成式 AI 教育应用",
+  "summary": "...",
+  "source_ids": ["S001", "S007"],
+  "updated_at": "..."
+}
+```
+
+查询质量记忆：
+
+```json
+{
+  "query": "generative AI education applications",
+  "backend": "tavily",
+  "useful_source_rate": 0.88,
+  "last_used_at": "..."
+}
+```
+
+### 21.3 记忆读取策略
+
+不要将所有历史记忆直接放入 Prompt：
+
+```text
+当前主题
+  -> 检索相关历史摘要
+  -> 按相关性和新鲜度排序
+  -> 选择少量记忆
+  -> 注入 Planner 或 Reflection 上下文
+```
+
+### 21.4 记忆写入策略
+
+只有满足以下条件的结果才写入长期记忆：
+
+- 来源质量达到阈值
+- 摘要通过结构化校验
+- 引用来源可追溯
+- 不是明显的临时错误信息
+- 没有包含敏感用户数据
+
+## 22. API 和 SSE 生产协议
+
+### 22.1 API
+
+```text
+POST /api/research
+GET  /api/research/{research_id}
+GET  /api/research/{research_id}/stream
+POST /api/research/{research_id}/cancel
+GET  /api/research/{research_id}/report
+GET  /api/health
+```
+
+创建研究：
+
+```json
+{
+  "topic": "生成式 AI 在教育行业的应用趋势",
+  "options": {
+    "max_tasks": 4,
+    "max_results_per_task": 5,
+    "enable_reflection": true
+  }
+}
+```
+
+返回：
+
+```json
+{
+  "research_id": "r-20260910-001",
+  "status": "created"
+}
+```
+
+### 22.2 SSE 事件类型
+
+```text
+event: research_started
+event: plan_created
+event: task_started
+event: search_started
+event: source_filtered
+event: summary_created
+event: task_completed
+event: reflection
+event: provider_fallback
+event: heartbeat
+event: report_started
+event: report_completed
+event: research_failed
+event: research_completed
+```
+
+事件数据示例：
+
+```json
+{
+  "event_id": "evt-00012",
+  "research_id": "r-001",
+  "task_id": "task-002",
+  "status": "SUMMARIZING",
+  "progress": 62,
+  "message": "正在生成任务摘要",
+  "timestamp": "2026-09-10T10:00:00Z"
+}
+```
+
+### 22.3 SSE 断线恢复
+
+客户端保存最后一个 `event_id`，重连时发送：
+
+```text
+Last-Event-ID: evt-00012
+```
+
+后端从 Redis 事件列表中补发之后的事件。
+
+## 23. 可观测性设计
+
+### 23.1 日志字段
+
+所有关键日志应包含：
+
+```text
+request_id
+research_id
+task_id
+agent_name
+stage
+provider
+model
+attempt
+elapsed_ms
+status
+error_type
+```
+
+不要记录：
+
+- API Key
+- Authorization Header
+- 用户敏感信息
+- 未脱敏的私有网页正文
+
+### 23.2 指标
+
+研究指标：
+
+- 研究成功率
+- 平均研究耗时
+- P95 研究耗时
+- 单任务成功率
+- 任务重试次数
+- 反思触发率
+
+搜索指标：
+
+- 搜索成功率
+- 平均响应时间
+- P95 响应时间
+- 429 比例
+- 降级比例
+- 缓存命中率
+- 每次研究平均来源数
+
+LLM 指标：
+
+- 输入 Token 数
+- 输出 Token 数
+- 每个 Agent 调用次数
+- LLM 超时率
+- JSON 解析失败率
+- 报告生成成功率
+
+质量指标：
+
+- 来源有效率
+- 来源重复率
+- 低质量来源过滤率
+- 事实引用覆盖率
+- 非法引用率
+- 人工评价分数
+
+### 23.3 成本指标
+
+每个研究记录：
+
+```text
+llm_input_tokens
+llm_output_tokens
+search_calls
+cache_hits
+cache_misses
+retry_count
+fallback_count
+estimated_cost
+```
+
+缓存带来的“Token 消耗下降 7%”需要使用固定实验集验证，记录优化前后：
+
+- 平均输入 Token
+- 平均输出 Token
+- 总 Token
+- 平均延迟
+- 报告质量
+- 研究成本
+
+## 24. 安全、限流和数据治理
+
+### 24.1 API Key
+
+真实密钥只允许存在于：
+
+```text
+backend/.env
+```
+
+禁止进入：
+
+- `.env.example`
+- Git 提交
+- 前端构建产物
+- SSE 数据
+- 日志
+- 错误堆栈
+
+### 24.2 请求限流
+
+建议限制：
+
+- 单用户同时运行研究数
+- 单 IP 创建研究频率
+- 单研究最大任务数
+- 单任务最大来源数
+- 单研究最大搜索次数
+- 单研究最大 Token 预算
+- 单研究最大运行时间
+
+### 24.3 网页数据治理
+
+网页正文可能包含：
+
+- 用户提交的敏感查询
+- 第三方个人信息
+- Prompt Injection
+- 恶意脚本或恶意指令
+
+网页内容必须作为不可信数据处理：
+
+- 不执行网页中的代码
+- 不执行网页中的工具调用指令
+- 不把网页内容当作系统 Prompt
+- 对 HTML、脚本和嵌入内容进行清洗
+- 报告生成时明确“来源内容是外部资料”
+
+## 25. 生产级配置建议
+
+```env
+# Research limits
+MAX_RESEARCH_TASKS=4
+MAX_RESULTS_PER_TASK=5
+MAX_RESEARCH_LOOPS=3
+RESEARCH_TOTAL_TIMEOUT=600
+TASK_TIMEOUT=120
+
+# Context engineering
+REDIS_URL=redis://localhost:6379/0
+SEARCH_CACHE_TTL=21600
+PAGE_CACHE_TTL=86400
+SUMMARY_CACHE_TTL=86400
+EVENT_CACHE_TTL=3600
+MAX_CONTEXT_TOKENS=16000
+
+# Search resilience
+SEARCH_PRIMARY=tavily
+SEARCH_FALLBACKS=duckduckgo,baidu
+SEARCH_MAX_PROVIDER_ATTEMPTS=2
+SEARCH_BASE_RETRY_DELAY=1
+SEARCH_MAX_RETRY_DELAY=30
+TAVILY_TIMEOUT=60
+
+# LLM resilience
+LLM_PLAN_TIMEOUT=60
+LLM_TASK_TIMEOUT=120
+LLM_REPORT_TIMEOUT=180
+LLM_PLAN_MAX_TOKENS=800
+LLM_TASK_MAX_TOKENS=1500
+LLM_REPORT_MAX_TOKENS=2500
+UPSTREAM_RETRIES=2
+
+# Source quality
+MIN_SOURCE_QUALITY_SCORE=0.55
+MIN_SOURCE_RELEVANCE_SCORE=0.50
+MAX_SOURCES_PER_TASK=8
+ENABLE_SOURCE_FILTER=true
+
+# Observability
+LOG_LEVEL=INFO
+LOG_FILE=
+ENABLE_METRICS=true
+```
+
+## 26. 实施路线图
+
+### Phase 1：稳定当前链路
+
+1. 拆分 `main.py` 中的 LLM、Tavily 和 SSE 逻辑。
+2. 增加结构化 Pydantic 数据模型。
+3. 增加任务级总结 Agent。
+4. 增加来源固定编号和引用校验。
+5. 增加总超时预算和任务级失败处理。
+6. 更新 README 的接口和启动文档。
+
+### Phase 2：引入状态和上下文工程
+
+1. 增加 `research_id` 和任务 ID。
+2. 引入 Redis 运行时状态。
+3. 增加搜索查询缓存。
+4. 增加网页内容缓存。
+5. 增加任务摘要缓存。
+6. 增加状态机和状态恢复。
+7. 增加 SSE 事件缓存和断线恢复。
+
+### Phase 3：提升搜索质量和可靠性
+
+1. 抽象统一的 SearchProvider 接口。
+2. 增加 Tavily、DuckDuckGo、Baidu 降级链路。
+3. 增加指数退避和错误分类。
+4. 增加网页质量过滤。
+5. 增加 URL、内容和语义去重。
+6. 增加来源质量统计。
+
+### Phase 4：完整 Deep Research
+
+1. 增加 ReflectionAgent。
+2. 增加补充检索循环。
+3. 增加长期记忆。
+4. 增加受控并发搜索。
+5. 增加后台 Worker。
+6. 增加报告版本和历史研究。
+7. 增加完整自动化测试和离线评测集。
+
+## 27. 验收标准
+
+生产版本至少应满足：
+
+- 单个搜索任务失败不会直接导致整个研究失败。
+- 研究可以通过 `research_id` 查询和恢复。
+- SSE 断线后可以从最近事件继续接收。
+- 相同查询和网页能够命中缓存。
+- 最终报告不会直接携带全部原始网页正文。
+- LLM 报告阶段输入 Token 有明确上限。
+- 搜索服务出现超时、429 或 5xx 时可以重试或降级。
+- 401、403、404 等配置错误不会无意义重试。
+- 每个来源具有稳定的来源 ID。
+- 报告中的引用均能映射到真实来源。
+- 低质量和重复来源在进入 LLM 前被过滤。
+- 研究中间结果能够持久化。
+- 研究可取消，资源可以释放。
+- 日志可以通过 `research_id` 还原完整执行链路。
+- API Key 不出现在日志、前端和文档中。
+- 有可重复的缓存、Token、延迟和质量对比实验。
