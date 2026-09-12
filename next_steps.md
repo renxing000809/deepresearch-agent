@@ -840,12 +840,12 @@ ENABLE_METRICS=true
 
 ### Phase 1：稳定当前链路
 
-- [ ] 实现 `SummarizerAgent`。
-- [ ] 增加 `models.py` 和结构化数据模型。
-- [ ] 拆分 `main.py`。
-- [ ] 增加任务级 Prompt 和版本号。
-- [ ] 最终报告只读取任务摘要。
-- [ ] 增加来源 ID 和引用校验。
+- [x] 实现 `SummarizerAgent`。
+- [x] 增加 `models.py` 和结构化数据模型。
+- [x] 拆分 `main.py`。
+- [x] 增加任务级 Prompt 和版本号。
+- [x] 最终报告只读取任务摘要。
+- [x] 增加来源 ID 和引用校验。
 - [ ] 增加研究总超时。
 
 ### Phase 2：完善前后端研究状态
@@ -940,3 +940,36 @@ ENABLE_METRICS=true
 - 大规模并发搜索
 - 多租户缓存
 - 复杂向量数据库
+
+## 17. 2026-09-12：完成任务级总结第一阶段
+
+- 状态：部分完成
+- 修改文件：
+  - `backend/src/main.py`
+  - `backend/src/models.py`
+  - `backend/src/prompts.py`
+  - `backend/src/services/llm.py`
+  - `backend/src/services/search.py`
+  - `backend/src/services/planner.py`
+  - `backend/src/services/summarizer.py`
+  - `backend/src/services/reporter.py`
+  - `backend/tests/test_pipeline.py`
+  - `backend/.env.example`
+- 已完成：
+  - 每个研究任务独立执行搜索和任务总结。
+  - 最终报告只接收任务级摘要和来源注册表。
+  - 来源分配稳定的 `S001`、`S002` 编号。
+  - 报告生成后检查未注册来源引用。
+  - 增加任务级 SSE 事件：任务开始、搜索开始、搜索完成、总结开始、总结完成、任务完成和报告完成。
+  - 增加 Planner、Summarizer、Reporter 的服务拆分。
+  - 增加 Mock 测试覆盖 JSON 解析、引用校验和完整任务级事件链路。
+- 验证命令：
+  - `python -m unittest discover -s tests -v`
+  - `python -m compileall -q src tests run.py`
+  - `npm run build`
+- 验证结果：以上检查通过。
+- 未完成：
+  - 研究总超时和任务总超时。
+  - Redis 运行时状态和缓存。
+  - 前端任务列表和完整日志展示。
+  - 搜索 Provider 降级和网页质量过滤。
